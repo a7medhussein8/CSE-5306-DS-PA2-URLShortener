@@ -1,0 +1,60 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies including debugging tools
+RUN apt-get update && apt-get install -y \
+    gcc \
+    iputils-ping \
+    curl \
+    netcat-openbsd \
+    dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install dependencies
+COPY microservices_http/ratelimit_service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# CRITICAL FIX: Upgrade protobuf to match runtime version
+RUN pip install --upgrade protobuf==5.28.2
+
+# Copy proto file and generate Python code
+COPY raft.proto /app/
+RUN python -m grpc_tools.protoc \
+    -I. \
+    --python_out=. \
+    --grpc_python_out=. \
+    raft.proto
+
+# Verify protobuf generation
+RUN python -c "import raft_pb2; import raft_pb2_grpc; print('✓ Protobuf files generated successfully')"
+
+# Copy shared/common modules
+COPY common /app/common
+COPY persistence /app/persistence
+
+# Copy Raft implementation (FIXED VERSION!)
+# IMPORTANT: Make sure you're using the fixed raft_simple.py
+COPY raft_simple.py /app/
+
+# Copy the ratelimit service app (with FastAPI + Raft)
+COPY microservices_http/ratelimit_service/app.py /app/
+
+# Copy debug script (optional but recommended)
+COPY debug_grpc.py /app/ 
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Set Python to run in unbuffered mode for better logging
+ENV PYTHONUNBUFFERED=1
+
+# Expose HTTP port and gRPC port
+EXPOSE 8003 50051
+
+# Health check for Docker
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')" || exit 1
+
+# Run the application
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8003", "--log-level", "info"]

@@ -1,3 +1,0 @@
-FROM redis:7-alpine
-# Enable AOF for durability
-CMD ["redis-server", "--appendonly", "yes"]

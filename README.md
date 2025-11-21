@@ -1,3 +1,4 @@
+Get-Content body.json
 # CSE-5306-DS-PA2-URLShortener
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

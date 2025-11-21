@@ -1,4 +1,0 @@
-FROM redis:7-alpine
-# Follows REDIS_MASTER_HOST env (defaults to 'redis-master') and replicates from it
-ENV REDIS_MASTER_HOST=redis-master
-CMD ["sh", "-lc", "exec redis-server --replicaof ${REDIS_MASTER_HOST:-redis-master} 6379 --replica-read-only yes"]
