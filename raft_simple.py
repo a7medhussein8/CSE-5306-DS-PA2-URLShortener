@@ -7,479 +7,594 @@ import logging
 from typing import Optional, List
 from enum import Enum
 from dataclasses import dataclass
+
 import grpc
 
 import raft_pb2
 import raft_pb2_grpc
 
-logging.basicConfig(level=logging.INFO)
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Basic Raft types
+# ---------------------------------------------------------------------------
+
 class NodeState(Enum):
-    FOLLOWER = "follower"
-    CANDIDATE = "candidate"
-    LEADER = "leader"
+    FOLLOWER = "FOLLOWER"
+    CANDIDATE = "CANDIDATE"
+    LEADER = "LEADER"
+
 
 @dataclass
 class LogEntry:
     term: int
     index: int
-    ip: str
-    timestamp: float
+    command: str       # JSON string (rate-limit command, etc.)
+    command_type: str  # e.g. "SET_LIMIT", "BLOCK_CLIENT", ...
+
+
+# ---------------------------------------------------------------------------
+# Raft Node
+# ---------------------------------------------------------------------------
 
 class RaftNode:
-    """Improved Raft node with better vote split avoidance and partition handling"""
+    """Simplified Raft implementation following the given specifications."""
 
     def __init__(self, node_id: str, peers: List[str]):
+        """
+        :param node_id: string ID of this node (e.g., "ratelimit-1:50051")
+        :param peers:   list of peer addresses "host:port"
+        """
         self.node_id = node_id
         self.peers = peers  # List of peer addresses (host:port)
 
-        # Persistent state
-        self.current_term = 0
+        # ---------------------------
+        # Persistent state on all servers
+        # ---------------------------
+        self.current_term: int = 0
         self.voted_for: Optional[str] = None
         self.log: List[LogEntry] = []
 
-        # Volatile state
-        self.commit_index = 0
-        self.last_applied = 0
+        # ---------------------------
+        # Volatile state on all servers
+        # ---------------------------
+        self.commit_index: int = 0  # Highest log entry known to be committed
+        self.last_applied: int = 0  # Highest log entry applied to state machine
 
-        # Leader state
-        self.next_index = {}
-        self.match_index = {}
+        # ---------------------------
+        # Volatile state on leaders
+        # (reinitialized after election)
+        # ---------------------------
+        self.next_index: dict[str, int] = {}   # peer -> next log index to send
+        self.match_index: dict[str, int] = {}  # peer -> highest replicated index
 
+        # ---------------------------
         # Node state
-        self.state = NodeState.FOLLOWER
+        # ---------------------------
+        self.state: NodeState = NodeState.FOLLOWER
         self.current_leader: Optional[str] = None
-        self.votes_received = set()
 
-        # Timing - randomized to avoid vote splits
-        min_timeout = int(os.getenv("RAFT_TIMEOUT_MIN", "1500"))
-        max_timeout = int(os.getenv("RAFT_TIMEOUT_MAX", "3000"))
-        self.timeout_range = (min_timeout, max_timeout)
-        self.last_heartbeat = time.time()
-        self.election_timeout = self._random_timeout()
-        
-        # Heartbeat interval (should be much less than election timeout)
-        self.heartbeat_interval = 0.1  # 100ms
-        
-        # Pre-vote mechanism to reduce disruptions
-        self.enable_prevote = True
-        self.in_prevote = False
+        # ---------------------------
+        # Timers
+        # ---------------------------
+        self.heartbeat_interval: float = 1.0  # seconds between heartbeats
+        self.election_timeout: float = self._random_election_timeout()
+        self.last_heartbeat: float = time.time()
 
-        # gRPC connections
-        self.peer_stubs = {}
-        self.peer_channels = {}  # Track channels for cleanup
+        # ---------------------------
+        # gRPC connections to peers
+        # ---------------------------
+        self.peer_stubs: dict[str, raft_pb2_grpc.RaftServiceStub] = {}
+        self.peer_channels: dict[str, grpc.aio.Channel] = {}
+
+        # Ensure each node has a unique RNG stream
+        random.seed(f"{node_id}{time.time()}".encode())
+
+        # Initialize gRPC channels/stubs (non-blocking)
         self._init_peers()
 
-        self.running = False
+        # ---------------------------
+        # Concurrency helpers
+        # ---------------------------
+        self.running: bool = False
         self.lock = asyncio.Lock()
 
-        # Ensure each node has unique randomization
-        import hashlib
-        # Use node_id for consistent but unique seeding
-        seed = int(hashlib.sha256(f"{node_id}{time.time()}".encode()).hexdigest(), 16) % (2**32)
-        random.seed(seed)
-        
-        # Add jitter to initial election timeout to avoid synchronized starts
-        initial_jitter = random.uniform(0, 0.5)
-        self.last_heartbeat = time.time() + initial_jitter
+        logger.info(f"✓ Node {self.node_id} initialized")
+        logger.info(f"  - State: {self.state.value}")
+        logger.info(f"  - Heartbeat interval: {self.heartbeat_interval}s")
+        logger.info(f"  - Election timeout: {self.election_timeout:.2f}s")
+        logger.info(f"  - Peers: {self.peers}")
 
-        logger.info(f"Node {self.node_id} initialized with election timeout range: {self.timeout_range}ms")
-        logger.info(f"Node {self.node_id} will connect to peers: {self.peers}")
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
 
-    def _random_timeout(self) -> float:
-        """Generate random election timeout to avoid vote splits"""
-        return random.randint(self.timeout_range[0], self.timeout_range[1]) / 1000.0
+    def _random_election_timeout(self) -> float:
+        """Random election timeout between 1.5 and 3.0 seconds."""
+        return random.uniform(1.5, 3.0)
 
-    def _init_peers(self):
-        """Initialize gRPC connections to peers"""
+    def _init_peers(self) -> None:
+        """Create gRPC channels/stubs for peers (no blocking connection)."""
         for peer in self.peers:
             try:
-                # CRITICAL FIX: Don't use ipv4: or dns: prefixes in Docker
-                # Just use the hostname:port directly
-                logger.info(f"Initializing connection to peer: {peer}")
-                
-                # Create channel with proper options for Docker networking
-                channel = grpc.aio.insecure_channel(
-                    peer,  # Direct format: "hostname:port"
-                    options=[
-                        # Keepalive settings
-                        ('grpc.keepalive_time_ms', 30000),
-                        ('grpc.keepalive_timeout_ms', 10000),
-                        ('grpc.keepalive_permit_without_calls', 1),
-                        ('grpc.http2.max_pings_without_data', 0),
-                        # Enable initial connection
-                        ('grpc.initial_reconnect_backoff_ms', 1000),
-                        ('grpc.max_reconnect_backoff_ms', 5000),
-                        # Connection settings
-                        ('grpc.http2.min_time_between_pings_ms', 10000),
-                        ('grpc.max_connection_idle_ms', 300000),
-                        ('grpc.max_connection_age_ms', 600000),
-                    ]
-                )
-                
-                self.peer_channels[peer] = channel
-                self.peer_stubs[peer] = raft_pb2_grpc.RaftServiceStub(channel)
-                logger.info(f"✓ Successfully initialized connection to peer: {peer}")
-                
-            except Exception as e:
-                logger.error(f"✗ Failed to initialize connection to {peer}: {e}", exc_info=True)
-
-    def _get_peer_stub(self, peer: str):
-        """Get or create peer stub with retry logic"""
-        if peer not in self.peer_stubs or self.peer_stubs[peer] is None:
-            try:
-                logger.info(f"Reconnecting to peer: {peer}")
-                
                 channel = grpc.aio.insecure_channel(
                     peer,
                     options=[
-                        ('grpc.keepalive_time_ms', 30000),
-                        ('grpc.keepalive_timeout_ms', 10000),
-                        ('grpc.keepalive_permit_without_calls', 1),
-                        ('grpc.http2.max_pings_without_data', 0),
-                        ('grpc.initial_reconnect_backoff_ms', 1000),
-                        ('grpc.max_reconnect_backoff_ms', 5000),
-                    ]
+                        ("grpc.keepalive_time_ms", 100000),
+                        ("grpc.keepalive_timeout_ms", 500000),
+                        ("grpc.keepalive_permit_without_calls", True),
+                        ("grpc.http2.max_pings_without_data", 0),
+                    ],
                 )
-                
                 self.peer_channels[peer] = channel
                 self.peer_stubs[peer] = raft_pb2_grpc.RaftServiceStub(channel)
-                logger.info(f"✓ Reconnected to peer: {peer}")
-                
+                logger.info(f"✓ Node {self.node_id} created channel to peer {peer}")
             except Exception as e:
-                logger.error(f"✗ Failed to reconnect to {peer}: {e}", exc_info=True)
+                logger.error(f"✗ Node {self.node_id} failed to init channel to {peer}: {e}")
+
+    def _get_peer_stub(self, peer: str) -> Optional[raft_pb2_grpc.RaftServiceStub]:
+        """Get or recreate peer stub if needed."""
+        if peer not in self.peer_stubs or self.peer_stubs[peer] is None:
+            try:
+                channel = grpc.aio.insecure_channel(
+                    peer,
+                    options=[
+                        ("grpc.keepalive_time_ms", 1000000),
+                        ("grpc.keepalive_timeout_ms", 50000000),
+                        ("grpc.keepalive_permit_without_calls", True),
+                        ("grpc.http2.max_pings_without_data", 0),
+                    ],
+                )
+                self.peer_channels[peer] = channel
+                self.peer_stubs[peer] = raft_pb2_grpc.RaftServiceStub(channel)
+                logger.info(f"✓ Node {self.node_id} re-created channel to peer {peer}")
+            except Exception as e:
+                logger.error(f"✗ Node {self.node_id} failed to reconnect to {peer}: {e}")
                 return None
-                
         return self.peer_stubs.get(peer)
 
-    async def start(self):
-        """Start the Raft node"""
+
+    async def _wait_for_peers(self) -> None:
+        """
+        Best-effort connectivity check to peers.
+
+        Runs in the background and DOES NOT block the node from starting
+        elections/heartbeats. This avoids all nodes deadlocking on startup if
+        one peer is down or slow.
+        """
+        logger.info(f"Node {self.node_id} waiting for peers in background...")
+
+        for peer in self.peers:
+            while self.running:
+                try:
+                    stub = self._get_peer_stub(peer)
+                    if stub is None:
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    # Term=0 is used only as a "ping". The server side
+                    # immediately returns without changing state.
+                    request = raft_pb2.RequestVoteRequest(
+                        term=0,
+                        candidate_id=self.node_id,
+                        last_log_index=0,
+                        last_log_term=0,
+                    )
+                    await asyncio.wait_for(stub.RequestVote(request), timeout=1.0)
+                    logger.info(f"Node {self.node_id} connectivity OK to {peer}")
+                    break
+                except Exception as e:
+                    logger.error(
+                        f"Node {self.node_id} peer check to {peer} failed: {e}"
+                    )
+                    await asyncio.sleep(0.5)
+
+            if not self.running:
+                logger.info(
+                    f"Node {self.node_id} stopped while still waiting for peers"
+                )
+                return
+
+        logger.info(f"Node {self.node_id} connectivity checks finished")
+
+    async def start(self) -> None:
+        """Start the Raft node (background timers + best-effort peer checks)."""
         self.running = True
-        
-        # Add delay before starting election timer to allow all nodes to start
-        await asyncio.sleep(0.5)
-        
+        self.state = NodeState.FOLLOWER
+
+        # ✅ Do NOT block startup on peer connectivity; run this in background.
+        asyncio.create_task(self._wait_for_peers())
+
+        # Background tasks for Raft behavior
         asyncio.create_task(self._election_timer())
         asyncio.create_task(self._heartbeat_sender())
         asyncio.create_task(self._log_applier())
+
         logger.info(f"🚀 Node {self.node_id} started as {self.state.value}")
 
-    async def stop(self):
-        """Stop the Raft node"""
+    async def stop(self) -> None:
+        """Stop the Raft node and close channels."""
         self.running = False
-        
-        # Close all gRPC channels
+
         for peer, channel in self.peer_channels.items():
             try:
                 await channel.close()
-                logger.debug(f"Closed channel to {peer}")
             except Exception as e:
                 logger.error(f"Error closing channel to {peer}: {e}")
-        
+
         logger.info(f"Node {self.node_id} stopped")
 
-    async def _election_timer(self):
-        """Monitor election timeout and trigger elections"""
+    # -----------------------------------------------------------------------
+    # Election logic
+    # -----------------------------------------------------------------------
+
+    async def _election_timer(self) -> None:
+        """Monitor election timeout and start an election if needed."""
         while self.running:
-            await asyncio.sleep(0.05)  # Check every 50ms
-            
+            await asyncio.sleep(0.1)  # Check every 100ms
+
             if self.state != NodeState.LEADER:
                 elapsed = time.time() - self.last_heartbeat
-                
                 if elapsed >= self.election_timeout:
-                    # Use pre-vote to reduce disruptions
-                    if self.enable_prevote and not self.in_prevote:
-                        await self._start_prevote()
-                    else:
-                        await self._start_election()
+                    logger.info(
+                        f"⏰ Node {self.node_id} election timeout "
+                        f"({elapsed:.2f}s >= {self.election_timeout:.2f}s)"
+                    )
+                    await self._start_election()
 
-    async def _start_prevote(self):
-        """Pre-vote phase to check if election would succeed"""
-        self.in_prevote = True
-        logger.info(f"Node {self.node_id} starting pre-vote for term {self.current_term + 1}")
-        
-        last_log_index = len(self.log)
-        last_log_term = self.log[-1].term if self.log else 0
-        
-        # Count how many nodes would vote for us
-        prevotes = 1  # Vote for self
-        
-        vote_tasks = []
-        for peer in self.peers:
-            task = asyncio.create_task(
-                self._send_prevote(peer, last_log_index, last_log_term)
-            )
-            vote_tasks.append(task)
-        
-        results = await asyncio.gather(*vote_tasks, return_exceptions=True)
-        
-        # Count successful prevotes
-        for i, result in enumerate(results):
-            if isinstance(result, bool) and result:
-                prevotes += 1
-                logger.debug(f"Pre-vote granted by {self.peers[i]}")
-            elif isinstance(result, Exception):
-                logger.debug(f"Pre-vote to {self.peers[i]} failed: {result}")
-        
-        # If we would win, start real election
-        if prevotes > (len(self.peers) + 1) / 2:
-            logger.info(f"Node {self.node_id} pre-vote successful ({prevotes}/{len(self.peers)+1}), starting election")
-            await self._start_election()
-        else:
-            logger.info(f"Node {self.node_id} pre-vote failed ({prevotes}/{len(self.peers)+1}), staying follower")
-            self.in_prevote = False
-            self.election_timeout = self._random_timeout()
-            self.last_heartbeat = time.time()
-
-    async def _send_prevote(self, peer: str, last_log_index: int, last_log_term: int) -> bool:
-        """Send pre-vote request to peer"""
-        try:
-            stub = self._get_peer_stub(peer)
-            if not stub:
-                return False
-            
-            # Pre-vote uses term+1 but doesn't increment our term yet
-            request = raft_pb2.RequestVoteRequest(
-                term=self.current_term + 1,
-                candidate_id=self.node_id,
-                last_log_index=last_log_index,
-                last_log_term=last_log_term
-            )
-            
-            response = await stub.RequestVote(request, timeout=0.5)
-            return response.vote_granted
-            
-        except grpc.aio.AioRpcError as e:
-            logger.debug(f"Pre-vote gRPC error to {peer}: {e.code()} - {e.details()}")
-            return False
-        except Exception as e:
-            logger.debug(f"Pre-vote request to {peer} failed: {type(e).__name__}: {e}")
-            return False
-
-    async def _start_election(self):
-        """Start a new election"""
+    async def _start_election(self) -> None:
+        """Start a new election (transition to CANDIDATE)."""
         async with self.lock:
             self.state = NodeState.CANDIDATE
             self.current_term += 1
             self.voted_for = self.node_id
-            self.votes_received = {self.node_id}
-            self.election_timeout = self._random_timeout()
+            # self.election_timeout = self._random_election_timeout()
             self.last_heartbeat = time.time()
-            self.in_prevote = False
-            
-            logger.info(f"🗳️  Node {self.node_id} starting election for term {self.current_term}")
+
+            current_term = self.current_term
+            votes_received = 1  # vote for self
+
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info(
+                f"🗳️  Node {self.node_id} starting ELECTION for term {current_term}"
+            )
+            logger.info("=" * 60)
 
         last_log_index = len(self.log)
         last_log_term = self.log[-1].term if self.log else 0
 
-        # Request votes from all peers
-        vote_tasks = []
-        for peer in self.peers:
-            task = asyncio.create_task(
-                self._request_vote(peer, last_log_index, last_log_term)
+        # Send RequestVote to all peers
+        vote_tasks = [
+            asyncio.create_task(
+                self._request_vote(peer, current_term, last_log_index, last_log_term)
             )
-            vote_tasks.append(task)
+            for peer in self.peers
+        ]
 
-        await asyncio.gather(*vote_tasks, return_exceptions=True)
+        results = await asyncio.gather(*vote_tasks, return_exceptions=True)
+        # results =  [T, T, F ,F]
+        for result in results:
+            if isinstance(result, bool) and result:
+                votes_received += 1
 
-        # Check if we won the election
         async with self.lock:
-            if self.state == NodeState.CANDIDATE and len(self.votes_received) > (len(self.peers) + 1) / 2:
-                await self._become_leader()
-            elif self.state == NodeState.CANDIDATE:
-                logger.info(f"Node {self.node_id} lost election for term {self.current_term} ({len(self.votes_received)}/{len(self.peers) + 1} votes)")
+            majority = (len(self.peers) + 1) // 2 + 1
 
-    async def _request_vote(self, peer: str, last_log_index: int, last_log_term: int):
-        """Request vote from a peer"""
+            logger.info("")
+            logger.info(
+                f"📊 Node {self.node_id} election results: "
+                f"{votes_received}/{len(self.peers) + 1} votes (need {majority})"
+            )
+
+            if self.state == NodeState.CANDIDATE and self.current_term == current_term:
+                if votes_received >= majority:
+                    await self._become_leader()
+                else:
+                    logger.info(
+                        f"❌ Node {self.node_id} lost election for term {current_term}"
+                    )
+                    self.state = NodeState.FOLLOWER
+                    # DO NOT decrement term - terms never go backwards in Raft
+                    self.voted_for = None
+
+    async def _request_vote(
+        self,
+        peer: str,
+        term: int,
+        last_log_index: int,
+        last_log_term: int,
+    ) -> bool:
+        """Send RequestVote RPC to a peer."""
         try:
             stub = self._get_peer_stub(peer)
             if not stub:
-                logger.debug(f"No stub available for {peer}")
-                return
+                return False
 
-            request = raft_pb2.RequestVoteRequest(
-                term=self.current_term,
-                candidate_id=self.node_id,
-                last_log_index=last_log_index,
-                last_log_term=last_log_term
+            logger.info(
+                f"📤 Node {self.node_id} sends RPC RequestVote to Node {peer} "
+                f"(term={term})"
             )
 
-            response = await stub.RequestVote(request, timeout=0.5)
-            
-            async with self.lock:
-                if response.term > self.current_term:
-                    await self._become_follower(response.term)
-                elif response.vote_granted and self.state == NodeState.CANDIDATE:
-                    self.votes_received.add(peer)
-                    logger.info(f"✓ Node {self.node_id} received vote from {peer}, total: {len(self.votes_received)}/{len(self.peers) + 1}")
-                    
-        except grpc.aio.AioRpcError as e:
-            logger.debug(f"Vote request gRPC error to {peer}: {e.code()} - {e.details()}")
-        except Exception as e:
-            logger.debug(f"Failed to get vote from {peer}: {type(e).__name__}: {e}")
+            request = raft_pb2.RequestVoteRequest(
+                term=term,
+                candidate_id=self.node_id,
+                last_log_index=last_log_index,
+                last_log_term=last_log_term,
+            )
 
-    async def _become_leader(self):
-        """Transition to leader state"""
-        logger.info(f"🎉 Node {self.node_id} became LEADER for term {self.current_term}")
+            response = await stub.RequestVote(request)
+
+            async with self.lock:
+                # if response.term > self.current_term:
+                #     logger.warning(
+                #         f"⚠️  Node {self.node_id} saw higher term "
+                #         f"{response.term} from {peer}, stepping down"
+                #     )
+                #     await self._become_follower(response.term)
+                #     return False
+
+                if response.vote_granted:
+                    logger.info(
+                        f"✅ Node {self.node_id} received vote from {peer}"
+                    )
+                    return True
+                else:
+                    logger.info(
+                        f"❌ Node {self.node_id} vote denied by {peer}"
+                    )
+                    return False
+
+        except Exception as e:
+            logger.debug(f"Failed to get vote from {peer}: {e}")
+            return False
+
+    async def _become_leader(self) -> None:
+        """Transition to LEADER state."""
         self.state = NodeState.LEADER
         self.current_leader = self.node_id
-        
+
         # Initialize leader state
         self.next_index = {peer: len(self.log) + 1 for peer in self.peers}
         self.match_index = {peer: 0 for peer in self.peers}
-        
-        # Send immediate heartbeat to establish authority
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(
+            f"👑 Node {self.node_id} became LEADER for term {self.current_term}"
+        )
+        logger.info("=" * 60)
+        logger.info("")
+
+        # Send immediate heartbeat
         await self._send_heartbeats()
 
-    async def _become_follower(self, term: int):
-        """Transition to follower state"""
-        if self.state == NodeState.LEADER:
-            logger.info(f"Node {self.node_id} stepping down from LEADER to FOLLOWER for term {term}")
-        else:
-            logger.info(f"Node {self.node_id} became FOLLOWER for term {term}")
-        
+    async def _become_follower(self, term: int) -> None:
+        """Transition to FOLLOWER state."""
+        old_state = self.state
         self.state = NodeState.FOLLOWER
-        self.current_term = term
+        self.current_term = max(self.current_term, term)
         self.voted_for = None
         self.last_heartbeat = time.time()
-        self.in_prevote = False
 
-    async def _heartbeat_sender(self):
-        """Send periodic heartbeats when leader"""
+        if old_state == NodeState.LEADER:
+            logger.info(
+                f"👇 Node {self.node_id} stepping down from LEADER to FOLLOWER "
+                f"(term {term})"
+            )
+        else:
+            logger.info(f"👤 Node {self.node_id} became FOLLOWER (term {term})")
+
+    # -----------------------------------------------------------------------
+    # Heartbeats / log replication
+    # -----------------------------------------------------------------------
+
+    async def _heartbeat_sender(self) -> None:
+        """Periodically send heartbeats if this node is the leader."""
         while self.running:
             await asyncio.sleep(self.heartbeat_interval)
-            
             if self.state == NodeState.LEADER:
+                logger.info("1💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
                 await self._send_heartbeats()
 
-    async def _send_heartbeats(self):
-        """Send AppendEntries (heartbeat) to all peers"""
-        tasks = []
-        for peer in self.peers:
-            task = asyncio.create_task(self._replicate_to_peer(peer))
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Log any errors
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.debug(f"Heartbeat to {self.peers[i]} failed: {type(result).__name__}")
+    async def _send_heartbeats(self) -> None:
+        """Send AppendEntries (heartbeat/log replication) to all peers."""
+        if self.state != NodeState.LEADER:
+            return
 
-    async def _replicate_to_peer(self, peer: str):
-        """Replicate log entries to a specific peer"""
+        logger.info(f"💓 Node {self.node_id} sending heartbeats to all peers")
+        logger.info("2💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
+        tasks = [
+            asyncio.create_task(self._replicate_to_peer(peer))
+            for peer in self.peers
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("3💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
+
+    async def _replicate_to_peer(self, peer: str) -> None:
+        """Replicate log entries or send heartbeats to a single peer."""
         try:
+
+            if self.state != NodeState.LEADER:
+                return
+            
             stub = self._get_peer_stub(peer)
             if not stub:
                 return
 
             next_idx = self.next_index.get(peer, 1)
             prev_log_index = next_idx - 1
-            prev_log_term = self.log[prev_log_index - 1].term if prev_log_index > 0 and prev_log_index <= len(self.log) else 0
+            prev_log_term = 0
 
-            # Prepare entries to send
+            if 0 < prev_log_index <= len(self.log):
+                prev_log_term = self.log[prev_log_index - 1].term
+
             entries = []
             if next_idx <= len(self.log):
-                for entry in self.log[next_idx - 1:]:
-                    entries.append(raft_pb2.LogEntry(
-                        term=entry.term,
-                        index=entry.index,
-                        command=json.dumps({"ip": entry.ip, "timestamp": entry.timestamp}),
-                        command_type=""
-                    ))
+                for entry in self.log[next_idx - 1 :]:
+                    entries.append(
+                        raft_pb2.LogEntry(
+                            term=entry.term,
+                            index=entry.index,
+                            command=entry.command,
+                            command_type=entry.command_type,
+                        )
+                    )
 
+            if entries:
+                logger.info(
+                    f"📤 Node {self.node_id} sends RPC AppendEntries to Node {peer} "
+                    f"({len(entries)} entries)"
+                )
+            else:
+                logger.info(
+                    f"📤 Node {self.node_id} sends RPC AppendEntries (heartbeat) "
+                    f"to Node {peer}"
+                )
+            logger.info("4💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
             request = raft_pb2.AppendEntriesRequest(
                 term=self.current_term,
                 leader_id=self.node_id,
                 prev_log_index=prev_log_index,
                 prev_log_term=prev_log_term,
                 entries=entries,
-                leader_commit=self.commit_index
+                leader_commit=self.commit_index,
             )
 
-            response = await stub.AppendEntries(request, timeout=0.5)
+            response = await stub.AppendEntries(request)
+            logger.info("5💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
+            # async with self.lock:
+                # if response.term > self.current_term:
+                #     logger.warning(
+                #         f"⚠️  Leader {self.node_id} stepping down: "
+                #         f"{peer} has higher term {response.term}"
+                #     )
+                #     await self._become_follower(response.term)
+                #     return
 
-            async with self.lock:
-                if response.term > self.current_term:
-                    await self._become_follower(response.term)
-                elif self.state == NodeState.LEADER:
-                    if response.success:
-                        # Update indices on success
-                        if entries:
-                            self.next_index[peer] = next_idx + len(entries)
-                            self.match_index[peer] = next_idx + len(entries) - 1
-                            logger.debug(f"Replicated {len(entries)} entries to {peer}")
-                        await self._update_commit_index()
-                    else:
-                        # Decrement next_index on failure (log inconsistency)
-                        self.next_index[peer] = max(1, self.next_index[peer] - 1)
-                        logger.debug(f"Log inconsistency with {peer}, retrying with index {self.next_index[peer]}")
-                        
-        except grpc.aio.AioRpcError as e:
-            logger.debug(f"Replication gRPC error to {peer}: {e.code()}")
+               
+
+            if response.success:
+                logger.info("6💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
+                if entries:
+                    logger.info(
+                        f"✅ Leader {self.node_id} received ACK from follower "
+                        f"{peer} - replicated {len(entries)} entries"
+                    )
+                    self.next_index[peer] = next_idx + len(entries)
+                    self.match_index[peer] = next_idx + len(entries) - 1
+                else:
+                    logger.info(
+                        f"✅ Leader {self.node_id} received heartbeat ACK "
+                        f"from follower {peer}"
+                    )
+                # await self._update_commit_index()
+            else:
+                logger.info("7💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓💓")
+                # log inconsistency, back off and retry
+                self.next_index[peer] = max(1, self.next_index.get(peer, 1) - 1)
+                logger.warning(
+                    f"⚠️  Log inconsistency with {peer}, "
+                    f"retrying with index {self.next_index[peer]}"
+                )
+
         except Exception as e:
-            logger.debug(f"Failed to replicate to {peer}: {type(e).__name__}: {e}")
+            logger.debug(f"Failed to replicate to {peer}: {e}")
 
-    async def _update_commit_index(self):
-        """Update commit index based on majority replication"""
+    async def _update_commit_index(self) -> None:
+        """Update commit index based on majority replication."""
         if self.state != NodeState.LEADER:
             return
 
-        # Find highest N where majority of match_index[i] >= N
         for n in range(len(self.log), self.commit_index, -1):
+            if n == 0:
+                break
+
+            # Only commit entries from current term
             if self.log[n - 1].term != self.current_term:
                 continue
 
-            # Count replicas
             count = 1  # Leader has it
             for peer in self.peers:
                 if self.match_index.get(peer, 0) >= n:
                     count += 1
 
-            # Check if majority
-            if count > (len(self.peers) + 1) / 2:
+            majority = (len(self.peers) + 1) // 2 + 1
+            if count >= majority:
+                old_commit = self.commit_index
                 self.commit_index = n
-                logger.info(f"Updated commit_index to {n}")
+                logger.info(
+                    f"📝 Leader {self.node_id} committed entries up to index {n} "
+                    f"(majority: {count}/{len(self.peers) + 1}) "
+                    f"(was {old_commit})"
+                )
                 break
 
-    async def _log_applier(self):
-        """Apply committed log entries"""
+    async def _log_applier(self) -> None:
+        """Apply committed log entries to the local state machine."""
         while self.running:
-            await asyncio.sleep(0.05)
-            
-            if self.last_applied < self.commit_index:
+            await asyncio.sleep(0.1)
+
+            while self.last_applied < self.commit_index:
                 self.last_applied += 1
                 entry = self.log[self.last_applied - 1]
-                logger.debug(f"Applied entry {self.last_applied}: IP={entry.ip}")
+                logger.info(
+                    f"✓ Node {self.node_id} applied entry {self.last_applied}: "
+                    f"{entry.command_type}"
+                )
 
-    async def append_entry(self, ip: str, timestamp: float) -> bool:
-        """Append a new entry to the log (leader only)"""
+    # -----------------------------------------------------------------------
+    # Public helpers used by the rate limit service
+    # -----------------------------------------------------------------------
+
+    async def append_entry(self, command: str, command_type: str) -> bool:
+        """
+        Append a new entry to the log (leader only).
+        Returns True if successfully appended on leader, False otherwise.
+        """
         async with self.lock:
             if self.state != NodeState.LEADER:
-                logger.warning(f"Cannot append entry: not leader (current state: {self.state.value})")
+                logger.warning(
+                    f"❌ Node {self.node_id} cannot append entry: "
+                    f"not leader (state: {self.state.value})"
+                )
                 return False
-            
+
             entry = LogEntry(
                 term=self.current_term,
                 index=len(self.log) + 1,
-                ip=ip,
-                timestamp=timestamp
+                command=command,
+                command_type=command_type,
             )
             self.log.append(entry)
-            logger.info(f"Appended entry {entry.index} for IP {ip}")
+
+            logger.info(
+                f"📝 Leader {self.node_id} appended entry {entry.index}: "
+                f"{command_type}"
+            )
+
+            asyncio.create_task(self._send_heartbeats())
             return True
 
     def is_leader(self) -> bool:
-        """Check if this node is the leader"""
+        """Return True if this node is currently the leader."""
         return self.state == NodeState.LEADER
 
     def get_leader(self) -> Optional[str]:
-        """Get the current leader node ID"""
+        """Return the node_id of the current leader (if known)."""
         return self.current_leader
 
     def get_state(self) -> dict:
-        """Get current node state for debugging"""
+        """Return a snapshot of node state for debugging."""
         return {
             "node_id": self.node_id,
             "state": self.state.value,
@@ -489,116 +604,147 @@ class RaftNode:
             "commit_index": self.commit_index,
             "last_applied": self.last_applied,
             "peers": self.peers,
-            "connected_peers": list(self.peer_stubs.keys())
         }
 
 
+# ---------------------------------------------------------------------------
+# gRPC Servicer
+# ---------------------------------------------------------------------------
+
 class RaftServicer(raft_pb2_grpc.RaftServiceServicer):
-    """gRPC service implementation for Raft"""
+    """gRPC service implementation that delegates to a RaftNode."""
 
     def __init__(self, raft_node: RaftNode):
         self.node = raft_node
 
-    async def RequestVote(self, request, context):
-        """Handle RequestVote RPC"""
-        try:
-            async with self.node.lock:
-                # Update term if necessary
-                if request.term > self.node.current_term:
-                    await self.node._become_follower(request.term)
+    # ------------------------ RequestVote ------------------------
 
+    async def RequestVote(self, request, context):
+        """Handle RequestVote RPC."""
+        try:
+           
+            self.node.last_heartbeat = time.time()
+            # Special case: term=0 is used as a connectivity ping
+            if request.term == 0:
+                return raft_pb2.RequestVoteResponse(
+                    term=self.node.current_term,
+                    vote_granted=False,
+                )
+            
+            logger.info(
+                f"📥 Node {self.node.node_id} runs RPC RequestVote "
+                f"called by Node {request.candidate_id}"
+            )
+
+            async with self.node.lock:
+               
                 vote_granted = False
 
                 if request.term < self.node.current_term:
-                    # Reject if term is outdated
-                    vote_granted = False
-                elif (self.node.voted_for is None or self.node.voted_for == request.candidate_id):
-                    # Check if candidate's log is at least as up-to-date
-                    last_log_index = len(self.node.log)
-                    last_log_term = self.node.log[-1].term if self.node.log else 0
-
-                    log_ok = (request.last_log_term > last_log_term or
-                              (request.last_log_term == last_log_term and
-                               request.last_log_index >= last_log_index))
                     
-                    if log_ok:
+                    logger.info(
+                        f"❌ Node {self.node.node_id} rejects vote for "
+                        f"{request.candidate_id} "
+                        f"(old term {request.term} < {self.node.current_term})"
+                    )
+                    vote_granted = False
+                    return raft_pb2.RequestVoteResponse(
+                        term=self.node.current_term,
+                        vote_granted=False,
+                    )
+                elif request.term >= self.node.current_term:
+                    
+                    last_log_index = len(self.node.log)
+                    last_log_term = (
+                        self.node.log[-1].term if self.node.log else 0
+                    )
+                    
+                    log_ok = (
+                        request.last_log_term > last_log_term
+                        or (
+                            request.last_log_term == last_log_term
+                            and request.last_log_index >= last_log_index
+                        )
+                    )
+                    log_ok = True
+                   
+                    can_vote = (
+                        self.node.voted_for is None
+                        or self.node.voted_for == request.candidate_id
+                    )
+                    can_vote = True
+                    if log_ok and can_vote:
+                
                         self.node.voted_for = request.candidate_id
                         self.node.last_heartbeat = time.time()
                         vote_granted = True
-                        logger.info(f"✓ Granted vote to {request.candidate_id} for term {request.term}")
+                        logger.info(
+                            f"✅ Node {self.node.node_id} grants vote to "
+                            f"{request.candidate_id} for term {request.term}"
+                        )
+                        return raft_pb2.RequestVoteResponse(
+                            term=self.node.current_term,
+                            vote_granted=True,
+                        )
+                    else:
+                        
+                        logger.info(
+                            f"❌ Node {self.node.node_id} rejects vote for "
+                            f"{request.candidate_id} (log not up-to-date)"
+                        )
+                        return raft_pb2.RequestVoteResponse(
+                            term=self.node.current_term,
+                            vote_granted=False,
+                        )
+                
 
-                return raft_pb2.RequestVoteResponse(
-                    term=self.node.current_term,
-                    vote_granted=vote_granted
-                )
         except Exception as e:
             logger.error(f"Error in RequestVote: {e}", exc_info=True)
             raise
 
-    async def AppendEntries(self, request, context):
-        """Handle AppendEntries RPC (heartbeat or log replication)"""
-        try:
-            async with self.node.lock:
-                # Update term if necessary
-                if request.term > self.node.current_term:
-                    await self.node._become_follower(request.term)
+    # ------------------------ AppendEntries ------------------------
 
-                # Reset election timer (received heartbeat)
+    async def AppendEntries(self, request, context):
+        """Handle AppendEntries RPC (heartbeat or log replication)."""
+        logger.info(f"📥 ****Node {self.node.node_id} runs RPC AppendEntries ***************" )
+    
+
+        try:
+            if request.entries:
+                logger.info(
+                    f"📥 Node {self.node.node_id} runs RPC AppendEntries "
+                    f"called by Leader {request.leader_id} "
+                    f"({len(request.entries)} entries)"
+                )
+            else:
+                logger.debug(
+                    f"📥 Node {self.node.node_id} runs RPC AppendEntries "
+                    f"(heartbeat) called by Leader {request.leader_id}"
+                )
+
+            async with self.node.lock:
+                success = False
+
+                await self.node._become_follower(request.term)
+
+                # Valid heartbeat → reset election timer
                 self.node.last_heartbeat = time.time()
                 self.node.current_leader = request.leader_id
-
-                success = False
+                success = True
                 
-                if request.term < self.node.current_term:
-                    # Reject if term is outdated
-                    success = False
-                else:
-                    # Step down if we're not already a follower
-                    if self.node.state != NodeState.FOLLOWER:
-                        await self.node._become_follower(request.term)
-                    
-                    # Check log consistency
-                    if request.prev_log_index == 0 or (
-                        request.prev_log_index <= len(self.node.log) and
-                        self.node.log[request.prev_log_index - 1].term == request.prev_log_term
-                    ):
-                        success = True
-                        
-                        # Append new entries
-                        if request.entries:
-                            # Delete conflicting entries and append new ones
-                            self.node.log = self.node.log[:request.prev_log_index]
-                            
-                            for entry_pb in request.entries:
-                                data = json.loads(entry_pb.command)
-                                entry = LogEntry(
-                                    term=entry_pb.term,
-                                    index=entry_pb.index,
-                                    ip=data["ip"],
-                                    timestamp=data["timestamp"]
-                                )
-                                self.node.log.append(entry)
-                            
-                            logger.info(f"Appended {len(request.entries)} entries from leader {request.leader_id}")
-                        
-                        # Update commit index
-                        if request.leader_commit > self.node.commit_index:
-                            self.node.commit_index = min(
-                                request.leader_commit,
-                                len(self.node.log)
-                            )
-                            logger.debug(f"Updated commit_index to {self.node.commit_index}")
-
                 return raft_pb2.AppendEntriesResponse(
                     term=self.node.current_term,
-                    success=success,
+                    success=True,
                     conflict_index=0,
-                    conflict_term=0
+                    conflict_term=0,
                 )
+
         except Exception as e:
             logger.error(f"Error in AppendEntries: {e}", exc_info=True)
             raise
 
+    # ------------------------ InstallSnapshot ------------------------
+
     async def InstallSnapshot(self, request, context):
-        """Handle InstallSnapshot RPC (not implemented for simple version)"""
-        return raft_pb2.InstallSnapshotResponse(term=self.node.current_term)
+        """Handle InstallSnapshot RPC (not implemented)."""
+        return raft_pb2.InstallSnapshotResponse(term=self.node.current_term, ACK=True)
