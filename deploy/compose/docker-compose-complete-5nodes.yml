@@ -1,4 +1,4 @@
-version: "3.9"
+
 
 services:
   redis:
@@ -10,7 +10,7 @@ services:
       - raft-net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 3s
+      interval: 5s
       timeout: 2s
       retries: 3
       start_period: 5s
@@ -20,13 +20,13 @@ services:
   # -----------------------------
   ratelimit-1:
     build:
-      context: ../..                                  # project root
+      context: ../..
       dockerfile: deploy/docker/microservices/Dockerfile.ratelimit.raft
     container_name: ratelimit-1
     hostname: ratelimit-1
     ports:
-      - "8003:8003"          # HTTP
-      - "50051:50051"        # gRPC (Raft)
+      - "8003:8003"
+      - "50051:50051"
     environment:
       REDIS_URL: "redis://redis:6379/0"
       RL_LIMIT_PER_MIN: 120
@@ -34,20 +34,11 @@ services:
       NODE_ID: "ratelimit-1"
       RAFT_PORT: "50051"
       RAFT_PEERS: "ratelimit-2:50051,ratelimit-3:50051,ratelimit-4:50051,ratelimit-5:50051"
-      STARTUP_DELAY: "0"
-      RAFT_TIMEOUT_MIN: "1500"
-      RAFT_TIMEOUT_MAX: "3000"
     depends_on:
       redis:
         condition: service_healthy
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')\" || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
     restart: unless-stopped
 
   ratelimit-2:
@@ -66,22 +57,12 @@ services:
       NODE_ID: "ratelimit-2"
       RAFT_PORT: "50051"
       RAFT_PEERS: "ratelimit-1:50051,ratelimit-3:50051,ratelimit-4:50051,ratelimit-5:50051"
-      STARTUP_DELAY: "2"
-      RAFT_TIMEOUT_MIN: "1500"
-      RAFT_TIMEOUT_MAX: "3000"
     depends_on:
       redis:
         condition: service_healthy
-      ratelimit-1:
-        condition: service_healthy
+      # REMOVED: ratelimit-1 dependency (not needed, Raft handles it)
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')\" || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
     restart: unless-stopped
 
   ratelimit-3:
@@ -100,24 +81,11 @@ services:
       NODE_ID: "ratelimit-3"
       RAFT_PORT: "50051"
       RAFT_PEERS: "ratelimit-1:50051,ratelimit-2:50051,ratelimit-4:50051,ratelimit-5:50051"
-      STARTUP_DELAY: "4"
-      RAFT_TIMEOUT_MIN: "1500"
-      RAFT_TIMEOUT_MAX: "3000"
     depends_on:
       redis:
         condition: service_healthy
-      ratelimit-1:
-        condition: service_healthy
-      ratelimit-2:
-        condition: service_healthy
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')\" || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
     restart: unless-stopped
 
   ratelimit-4:
@@ -136,26 +104,11 @@ services:
       NODE_ID: "ratelimit-4"
       RAFT_PORT: "50051"
       RAFT_PEERS: "ratelimit-1:50051,ratelimit-2:50051,ratelimit-3:50051,ratelimit-5:50051"
-      STARTUP_DELAY: "6"
-      RAFT_TIMEOUT_MIN: "1500"
-      RAFT_TIMEOUT_MAX: "3000"
     depends_on:
       redis:
         condition: service_healthy
-      ratelimit-1:
-        condition: service_healthy
-      ratelimit-2:
-        condition: service_healthy
-      ratelimit-3:
-        condition: service_healthy
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')\" || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
     restart: unless-stopped
 
   ratelimit-5:
@@ -174,28 +127,12 @@ services:
       NODE_ID: "ratelimit-5"
       RAFT_PORT: "50051"
       RAFT_PEERS: "ratelimit-1:50051,ratelimit-2:50051,ratelimit-3:50051,ratelimit-4:50051"
-      STARTUP_DELAY: "8"
-      RAFT_TIMEOUT_MIN: "1500"
-      RAFT_TIMEOUT_MAX: "3000"
     depends_on:
       redis:
         condition: service_healthy
-      ratelimit-1:
-        condition: service_healthy
-      ratelimit-2:
-        condition: service_healthy
-      ratelimit-3:
-        condition: service_healthy
-      ratelimit-4:
-        condition: service_healthy
+      # REMOVED: All ratelimit dependencies
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')\" || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 15s
     restart: unless-stopped
 
   # -----------------------------
@@ -216,12 +153,6 @@ services:
         condition: service_healthy
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/healthz')\" || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
 
   analytics:
     build:
@@ -237,12 +168,6 @@ services:
         condition: service_healthy
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/healthz')\" || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
 
   api-gateway:
     build:
@@ -254,24 +179,13 @@ services:
     environment:
       REDIRECT_URL: "http://redirect:8001"
       ANALYTICS_URL: "http://analytics:8002"
-      # All ratelimit nodes are reached on port 8003 INSIDE the network
       RATELIMIT_URLS: "http://ratelimit-1:8003,http://ratelimit-2:8003,http://ratelimit-3:8003,http://ratelimit-4:8003,http://ratelimit-5:8003"
     depends_on:
       - redirect
       - analytics
-      - ratelimit-1
-      - ratelimit-2
-      - ratelimit-3
-      - ratelimit-4
-      - ratelimit-5
+      # REMOVED: ratelimit dependencies (gateway can handle retries)
     networks:
       - raft-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')\" || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
 
 networks:
   raft-net:

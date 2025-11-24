@@ -16,7 +16,7 @@ COPY microservices_http/ratelimit_service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # CRITICAL FIX: Upgrade protobuf to match runtime version
-RUN pip install --upgrade protobuf==5.28.2
+RUN pip install --upgrade protobuf
 
 # Copy proto file and generate Python code
 COPY raft.proto /app/
@@ -40,8 +40,6 @@ COPY raft_simple.py /app/
 # Copy the ratelimit service app (with FastAPI + Raft)
 COPY microservices_http/ratelimit_service/app.py /app/
 
-# Copy debug script (optional but recommended)
-COPY debug_grpc.py /app/ 
 
 # Set Python path
 ENV PYTHONPATH=/app

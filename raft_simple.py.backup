@@ -392,7 +392,7 @@ class RaftNode:
                 f"(term {term})"
             )
         else:
-            logger.info(f"👤 Node {self.node_id} is FOLLOWER (term {term})")
+            logger.info(f"👤 Node {self.node_id} became FOLLOWER (term {term})")
 
     # -----------------------------------------------------------------------
     # Heartbeats / log replication
@@ -713,130 +713,112 @@ class RaftServicer(raft_pb2_grpc.RaftServiceServicer):
 
     async def AppendEntries(self, request, context):
         """Handle AppendEntries RPC (heartbeat or log replication)."""
+        logger.info(
+                    f"📥 *******************************Node {self.node.node_id} runs RPC AppendEntries *******************************"
+                )
+        logger.info("1********************************")
+
         try:
             if request.entries:
-                logger.info("")
-                logger.info("=" * 80)
                 logger.info(
-                    f"📥 FOLLOWER {self.node.node_id} RECEIVED ENTRIES FROM LEADER {request.leader_id}"
+                    f"📥 Node {self.node.node_id} runs RPC AppendEntries "
+                    f"called by Leader {request.leader_id} "
+                    f"({len(request.entries)} entries)"
                 )
-                logger.info(f"   Total entries received: {len(request.entries)}")
-                logger.info("=" * 80)
-
-                # Print detailed information about each entry
-                for i, entry in enumerate(request.entries, 1):
-                    logger.info(f"   Entry #{i}:")
-                    logger.info(f"      📦 Index: {entry.index}")
-                    logger.info(f"      📦 Term: {entry.term}")
-                    logger.info(f"      📦 Type: {entry.command_type}")
-                    logger.info(f"      📦 Command: {entry.command}")
-                    logger.info("")
             else:
-                logger.info("")
-                logger.info("=" * 80)
-                logger.info(
-                    f"💓 FOLLOWER {self.node.node_id} RECEIVED HEARTBEAT FROM LEADER {request.leader_id}"
+                logger.debug(
+                    f"📥 Node {self.node.node_id} runs RPC AppendEntries "
+                    f"(heartbeat) called by Leader {request.leader_id}"
                 )
-                logger.info(f"   Leader Term: {request.term}")
-                logger.info(f"   Leader Commit Index: {request.leader_commit}")
-                logger.info(f"   Previous Log Index: {request.prev_log_index}")
-                logger.info(f"   Previous Log Term: {request.prev_log_term}")
-                logger.info("=" * 80)
-                logger.info("")
 
             async with self.node.lock:
-                # Update term and become follower if needed
+                success = False
+                logger.info("2********************************")
+
+                # return raft_pb2.AppendEntriesResponse(
+                #     term=self.node.current_term,
+                #     success=True,
+                #     conflict_index=0,
+                #     conflict_term=0,
+                # )
+
+                # Check term
+                # if request.term < self.node.current_term:
+                #     logger.warning(
+                #         f"❌ Node {self.node.node_id} rejects AppendEntries "
+                #         f"from {request.leader_id} "
+                #         f"(old term {request.term} < {self.node.current_term})"
+                #     )
+                #     success = False
+                # else:
+                    # # Update term / become follower if needed
+                    # if request.term > self.node.current_term:
+                    #     logger.info(
+                    #         f"⚠️  Node {self.node.node_id} saw higher term "
+                    #         f"{request.term} from leader {request.leader_id}"
+                    #     )
+                    #     await self.node._become_follower(request.term)
+
+                    # if self.node.state != NodeState.FOLLOWER:
                 await self.node._become_follower(request.term)
-                self.node.current_leader = request.leader_id
 
-                # Reset heartbeat timer
+                # Valid heartbeat → reset election timer
                 self.node.last_heartbeat = time.time()
+                self.node.current_leader = request.leader_id
+                success = True
+                logger.info("3********************************")
+                    # Log consistency checks
+                    # if request.prev_log_index == 0:
+                    #     success = True
+                    # elif request.prev_log_index <= len(self.node.log):
+                    #     if (
+                    #         self.node.log[request.prev_log_index - 1].term
+                    #         == request.prev_log_term
+                    #     ):
+                    #         success = True
+                    #     else:
+                    #         logger.warning(
+                    #             f"⚠️  Node {self.node.node_id} log inconsistency "
+                    #             f"at index {request.prev_log_index}"
+                    #         )
+                    #         success = False
+                    # else:
+                    #     logger.warning(
+                    #         f"⚠️  Node {self.node.node_id} missing log entries "
+                    #         f"(have {len(self.node.log)}, "
+                    #         f"need {request.prev_log_index})"
+                    #     )
+                    #     success = False
 
-                # Check if request term is less than current term
-                if request.term < self.node.current_term:
-                    logger.warning(
-                        f"⚠️  Rejecting AppendEntries: request term {request.term} < "
-                        f"current term {self.node.current_term}"
-                    )
-                    return raft_pb2.AppendEntriesResponse(
-                        term=self.node.current_term,
-                        success=False,
-                        conflict_index=0,
-                        conflict_term=0,
-                    )
+                    # # Append any new entries
+                    # if success and request.entries:
+                    #     self.node.log = self.node.log[: request.prev_log_index]
 
-                # Check log consistency (prev_log_index and prev_log_term)
-                if request.prev_log_index > 0:
-                    # Check if we have the previous log entry
-                    if request.prev_log_index > len(self.node.log):
-                        logger.warning(
-                            f"⚠️  Log inconsistency: prev_log_index {request.prev_log_index} > "
-                            f"log length {len(self.node.log)}"
-                        )
-                        return raft_pb2.AppendEntriesResponse(
-                            term=self.node.current_term,
-                            success=False,
-                            conflict_index=len(self.node.log) + 1,
-                            conflict_term=0,
-                        )
+                    #     for entry_pb in request.entries:
+                    #         entry = LogEntry(
+                    #             term=entry_pb.term,
+                    #             index=entry_pb.index,
+                    #             command=entry_pb.command,
+                    #             command_type=entry_pb.command_type,
+                    #         )
+                    #         self.node.log.append(entry)
 
-                    # Check if the term matches
-                    prev_entry = self.node.log[request.prev_log_index - 1]
-                    if prev_entry.term != request.prev_log_term:
-                        logger.warning(
-                            f"⚠️  Log inconsistency: prev_log_term mismatch at index "
-                            f"{request.prev_log_index}: expected {request.prev_log_term}, "
-                            f"got {prev_entry.term}"
-                        )
-                        return raft_pb2.AppendEntriesResponse(
-                            term=self.node.current_term,
-                            success=False,
-                            conflict_index=request.prev_log_index,
-                            conflict_term=prev_entry.term,
-                        )
+                    #     logger.info(
+                    #         f"✅ Node {self.node.node_id} appended "
+                    #         f"{len(request.entries)} entries from leader "
+                    #         f"{request.leader_id}"
+                    #     )
 
-                # Append new entries
-                if request.entries:
-                    for entry in request.entries:
-                        # Convert protobuf entry to our LogEntry dataclass
-                        log_entry = LogEntry(
-                            term=entry.term,
-                            index=entry.index,
-                            command=entry.command,
-                            command_type=entry.command_type,
-                        )
-
-                        # If this index already exists, check for conflicts
-                        if entry.index <= len(self.node.log):
-                            existing_entry = self.node.log[entry.index - 1]
-                            if existing_entry.term != entry.term:
-                                # Conflict: delete this and all following entries
-                                logger.info(
-                                    f"🗑️  Deleting conflicting entries from index {entry.index}"
-                                )
-                                self.node.log = self.node.log[:entry.index - 1]
-                                self.node.log.append(log_entry)
-                                logger.info(
-                                    f"✅ Follower {self.node.node_id} appended entry {entry.index}: "
-                                    f"{entry.command_type}"
-                                )
-                            # else: entry already exists and matches, skip
-                        else:
-                            # Append new entry
-                            self.node.log.append(log_entry)
-                            logger.info(
-                                f"✅ Follower {self.node.node_id} appended entry {entry.index}: "
-                                f"{entry.command_type} - {entry.command}"
-                            )
-
-                # Update commit index
-                if request.leader_commit > self.node.commit_index:
-                    old_commit = self.node.commit_index
-                    self.node.commit_index = min(request.leader_commit, len(self.node.log))
-                    logger.info(
-                        f"📝 Follower {self.node.node_id} updated commit_index: "
-                        f"{old_commit} → {self.node.commit_index}"
-                    )
+                    # # Update commit index
+                    # if success and request.leader_commit > self.node.commit_index:
+                    #     old_commit = self.node.commit_index
+                    #     self.node.commit_index = min(
+                    #         request.leader_commit, len(self.node.log)
+                    #     )
+                    #     logger.info(
+                    #         f"📝 Node {self.node.node_id} updated commit_index "
+                    #         f"from {old_commit} to {self.node.commit_index}"
+                    #     )
 
                 return raft_pb2.AppendEntriesResponse(
                     term=self.node.current_term,
